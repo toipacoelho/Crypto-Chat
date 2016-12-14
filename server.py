@@ -12,9 +12,10 @@ import json
 import sys
 import time
 import logging
+import random
 
 # Server address
-HOST = ""   # All available interfaces
+HOST = ""  # All available interfaces
 PORT = 8080  # The server port
 
 BUFSIZE = 512 * 1024
@@ -38,12 +39,14 @@ class Client:
         self.sa_data = None
         self.level = 0
         self.state = STATE_NONE
+        self.cipher = ""
         self.name = "Unknown"
 
     def __str__(self):
         """ Converts object into string.
         """
-        return "Client(id=%r addr:%s name:%s level:%d state:%d)" % (self.id, str(self.addr), self.name, self.level, self.state)
+        return "Client(id=%r addr:%s name:%s level:%d state:%d)" % (
+        self.id, str(self.addr), self.name, self.level, self.state)
 
     def asDict(self):
         return {'id': self.id, 'name': self.name, 'level': self.level}
@@ -61,13 +64,12 @@ class Client:
         This is called whenever data is available from client socket."""
 
         if len(self.bufin) + len(data) > MAX_BUFSIZE:
-            logging.error("Client (%s) buffer exceeds MAX BUFSIZE. %d > %d", 
-                (self, len(self.bufin) + len(data), MAX_BUFSIZE))
+            logging.error("Client (%s) buffer exceeds MAX BUFSIZE. %d > %d",
+                          (self, len(self.bufin) + len(data), MAX_BUFSIZE))
             self.bufin = ""
 
         self.bufin += data
         reqs = self.bufin.split(TERMINATOR)
-        print reqs
         self.bufin = reqs[-1]
         return reqs[:-1]
 
@@ -119,8 +121,8 @@ class Server:
         self.ss.listen(10)
         logging.info("Secure IM server listening on %s", self.ss.getsockname())
         # clients to manage (indexed by socket and by name):
-        self.clients = {}       # clients (key is socket)
-        self.id2client = {}   # clients (key is id)
+        self.clients = {}  # clients (key is socket)
+        self.id2client = {}  # clients (key is id)
 
     def stop(self):
         """ Stops the server closing all sockets
@@ -221,7 +223,7 @@ class Server:
             # sockets to select for reading: (the server socket + every open client connection)
             rlist = [self.ss] + self.clients.keys()
             # sockets to select for writing: (those that have something in bufout)
-            wlist = [ sock for sock in self.clients if len(self.clients[sock].bufout)>0 ]
+            wlist = [sock for sock in self.clients if len(self.clients[sock].bufout) > 0]
             logging.debug("select waiting for %dR %dW %dX", len(rlist), len(wlist), len(rlist))
             (rl, wl, xl) = select(rlist, wlist, rlist)
             logging.debug("select: %s %s %s", rl, wl, xl)
@@ -294,19 +296,30 @@ class Server:
             logging.warning("Client is already connected: %s" % sender)
             return
 
-        if not all (k in request.keys() for k in ("name", "ciphers", "phase", "id")):
+        if not all(k in request.keys() for k in ("name", "ciphers", "phase", "id")):
             logging.warning("Connect message with missing fields")
             return
 
-        msg = {'type': 'connect', 'phase': request['phase'] + 1, 'ciphers': ['NONE']}
+        if 'NONE' in request['ciphers']:
+            msg = {'type': 'connect', 'phase': request['phase'] + 1, 'ciphers': ['NONE']}
 
-        if len(request['ciphers']) > 1 or 'NONE' not in request['ciphers']:
-            logging.info("Connect continue to phase " + msg['phase'])
-            client.send(msg)
+        else:
+            possibilities = []
+            for p in request['ciphers']:
+                possibilities.append(p)
+            pos = random.randint(0, len(possibilities) - 1)
+            data = 'none'
+            msg = {'type': 'connect', 'phase': request['phase'] + 1, 'ciphers': [possibilities[pos]],
+                   'data': data}
+
+        if len(request['ciphers']) > 1:
+            logging.info("Connect continue to phase " + str(msg['phase']))
+            sender.send(msg)
             return
 
         self.id2client[request['id']] = sender
         sender.id = request['id']
+        sender.cipher = request['ciphers'][0]
         sender.name = request['name']
         sender.state = STATE_CONNECTED
         logging.info("Client %s Connected" % request['id'])
@@ -319,7 +332,8 @@ class Server:
             logging.warning("LIST from disconnected client: %s" % sender)
             return
 
-        sender.send({'type': 'secure', 'payload': {'type': 'list', 'data': self.clientList()}})
+        payload = {'type': 'list', 'data': self.clientList()}
+        sender.send({'type': 'secure', 'payload': payload})
 
     def processSecure(self, sender, request):
         """
@@ -333,8 +347,9 @@ class Server:
             logging.warning("Secure message with missing fields")
             return
 
-        # This is a secure message.
-        # TODO: Inner message is encrypted for us. Must decrypt and validate.
+        if not isinstance(request['payload'], dict):
+            request['payload'] = json.loads(request['payload'])
+
         if not 'type' in request['payload'].keys():
             logging.warning("Secure message without inner frame type")
             return
@@ -343,7 +358,7 @@ class Server:
             self.processList(sender, request['payload'])
             return
 
-        if not all (k in request['payload'].keys() for k in ("src", "dst")):
+        if not all(k in request['payload'].keys() for k in ("src", "dst")):
             return
 
         if not request['payload']['dst'] in self.id2client.keys():
@@ -360,7 +375,8 @@ if __name__ == "__main__":
     if len(sys.argv) > 1:
         PORT = int(sys.argv[1])
 
-    logging.basicConfig(stream=sys.stdout, level=logging.DEBUG, formatter=logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+    logging.basicConfig(stream=sys.stdout, level=logging.DEBUG,
+                        formatter=logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 
     serv = None
     while True:
