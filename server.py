@@ -1,4 +1,5 @@
 # encoding: utf-8
+# -*- coding: utf-8 -*-
 #
 # jpbarraca@ua.pt
 # jmr@ua.pt 2016
@@ -8,11 +9,21 @@
 
 from socket import *
 from select import *
+from cryptography import x509
+from cryptography.x509.oid import NameOID
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
 import json
 import sys
 import time
 import logging
 import random
+import base64
+import cc_util as cc
+import datetime
+import crypto
+
 
 # Server address
 HOST = ""  # All available interfaces
@@ -25,6 +36,10 @@ MAX_BUFSIZE = 64 * 1024
 STATE_NONE = 0
 STATE_CONNECTED = 1
 STATE_DISCONNECTED = 2
+
+LEVEL_NONE = 0
+LEVEL_LOW = 1
+LEVEL_HIGH = 2
 
 
 class Client:
@@ -46,10 +61,10 @@ class Client:
         """ Converts object into string.
         """
         return "Client(id=%r addr:%s name:%s level:%d state:%d)" % (
-        self.id, str(self.addr), self.name, self.level, self.state)
+            self.id, str(self.addr), self.name, self.level, self.state)
 
     def asDict(self):
-        return {'id': self.id, 'name': self.name, 'level': self.level}
+        return {'id': self.id, 'name': base64.b64encode(self.name), 'level': self.level}
 
     def setState(self, state):
         if state not in [STATE_CONNECTED, STATE_NONE, STATE_DISCONNECTED]:
@@ -123,6 +138,8 @@ class Server:
         # clients to manage (indexed by socket and by name):
         self.clients = {}  # clients (key is socket)
         self.id2client = {}  # clients (key is id)
+        self.key = crypto.genKeyPair('RSA')
+        self.cert = None
 
     def stop(self):
         """ Stops the server closing all sockets
@@ -152,6 +169,7 @@ class Server:
             return
 
         client = Client(csock, addr)
+        # client.level = 0
         self.clients[client.socket] = client
         logging.info("Client added: %s", client)
 
@@ -279,13 +297,14 @@ class Server:
         except Exception, e:
             logging.exception("Could not handle request")
 
-    def clientList(self):
+    def clientList(self, sender):
         """
         Return the client list
         """
         cl = []
         for k in self.clients:
-            cl.append(self.clients[k].asDict())
+            if self.clients[k].asDict()['level'] <= sender.level:
+                cl.append(self.clients[k].asDict())
         return cl
 
     def processConnect(self, sender, request):
@@ -300,15 +319,21 @@ class Server:
             logging.warning("Connect message with missing fields")
             return
 
+        cert = base64.b64decode(request['data']['cert'])
+        puk = base64.b64decode(request['data']['puk'])
+        nounce = str(request['data']['nounce'])
+        sign = base64.b64decode(request['data']['sign'])
+
         if 'NONE' in request['ciphers']:
             msg = {'type': 'connect', 'phase': request['phase'] + 1, 'ciphers': ['NONE']}
 
         else:
             possibilities = []
+            print request['ciphers']
             for p in request['ciphers']:
                 possibilities.append(p)
             pos = random.randint(0, len(possibilities) - 1)
-            data = 'none'
+            data = {'server_cert': open('server_cert.pem', 'r').read()}
             msg = {'type': 'connect', 'phase': request['phase'] + 1, 'ciphers': [possibilities[pos]],
                    'data': data}
 
@@ -317,10 +342,21 @@ class Server:
             sender.send(msg)
             return
 
+        if len(request['ciphers']) == 1:
+            sender.send(msg)
+
         self.id2client[request['id']] = sender
+
+        try:
+            if cc.vercompuk(puk, str(nounce), sign) and cc.ver_cert(cert):
+                sender.name = cc.get_name()
+                sender.level = 1
+        except:
+            sender.level = 0
+
         sender.id = request['id']
         sender.cipher = request['ciphers'][0]
-        sender.name = request['name']
+        sender.name = base64.b64decode(request['name'])
         sender.state = STATE_CONNECTED
         logging.info("Client %s Connected" % request['id'])
 
@@ -332,7 +368,7 @@ class Server:
             logging.warning("LIST from disconnected client: %s" % sender)
             return
 
-        payload = {'type': 'list', 'data': self.clientList()}
+        payload = {'type': 'list', 'data': self.clientList(sender)}
         sender.send({'type': 'secure', 'payload': payload})
 
     def processSecure(self, sender, request):
@@ -367,8 +403,11 @@ class Server:
 
         dst = self.id2client[request['payload']['dst']]
 
-        dst_message = {'type': 'secure', 'payload': request['payload']}
-        dst.send(dst_message)
+        if dst.level >= sender.level:
+            dst_message = {'type': 'secure', 'payload': request['payload']}
+            dst.send(dst_message)
+        else:
+            logging.error("Dst with greater %s level than src %s level", dst.level, sender.level)
 
 
 if __name__ == "__main__":
